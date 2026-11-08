@@ -317,7 +317,7 @@ class InboundTest(unittest.TestCase):
         self.assertEqual(len(self.batcher.msgs), 1)
     def test_cursor_not_saved_when_pending_fails(self):
         def boom(payload): raise RuntimeError("disk")
-        self.batcher.add = boom
+        self.batcher._add_unlocked = boom
         with self.assertRaises(RuntimeError):
             forward.handle_updates({"ret": 0, "get_updates_buf": "CUR",
                                     "msgs": [self.msg(OWNER, 9)]}, self.batcher)
@@ -452,6 +452,28 @@ class BindFileTest(unittest.TestCase):
         for name in ("qr.png", "qr_url.txt"):
             self.assertEqual(stat.S_IMODE(os.stat(os.path.join(TMP, name)).st_mode), 0o600)
         self.assertIn("qr-value", open(os.path.join(TMP, "qr_url.txt")).read())
+
+class HealthAndDedupTest(unittest.TestCase):
+    def test_session_pause_heartbeat_is_not_ok(self):
+        write_creds()
+        ilink.pause_session(now=5_000)
+        line = forward.write_heartbeat(5_010)
+        self.assertTrue(line.startswith("paused "))
+        self.assertEqual(forward.heartbeat_state(text=line, now=5_010), "paused")
+        self.assertEqual(forward.heartbeat_state(text="paused 8600 5010", now=8_000), "paused")
+        self.assertEqual(forward.heartbeat_state(text="5010", now=5_020, stale_s=600), "ok")
+        self.assertEqual(forward.heartbeat_state(text="1000", now=2_000, stale_s=600), "stale")
+        self.assertEqual(forward.heartbeat_state(text="", now=1), "starting")
+        ilink._clear_pause()
+    def test_seen_ids_are_not_capped(self):
+        ids = [str(i) for i in range(10001)]
+        merged = forward.merge_seen([], ids)
+        self.assertEqual(len(merged), 10001)
+        self.assertEqual(merged[0], "0")
+        again = forward.merge_seen(merged, ["0", "10001"])
+        self.assertEqual(again[0], "0")
+        self.assertEqual(len(again), 10002)
+        self.assertNotIn("seen evicted", open(os.path.join(TMP, "forward.log"), encoding="utf-8").read())
 
 if __name__ == "__main__":
     unittest.main()

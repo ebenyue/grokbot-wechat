@@ -38,7 +38,7 @@
 ### 入站（微信 → Grok Bot）
 1. `forward.py` 主线程循环调用 `ilink/bot/getupdates`，用 `state.json` 里的 `get_updates_buf` 当游标；
    超时 = 没消息，正常。
-2. 只处理绑定者的 `message_type == 1`（用户消息）；别人的消息和带 `group_id` 的消息不进入待发队列。按 `message_id` 去重（`forward_seen.json`，上限 10000，超出后可能再投递，不保证恰好一次）。游标在 pending 和 seen 落盘之后才保存。
+2. 只处理绑定者的 `message_type == 1`（用户消息）；别人的消息和带 `group_id` 的消息不进入待发队列。已处理的 `message_id` 全部记在 `forward_seen.json`，不再按条数丢掉旧 id。没有 `message_id` 的消息无法去重。游标在 seen 落盘之后才保存。这仍不是恰好一次：微信若用新的 id 重放同一条内容、seen 文件丢失，或 webhook 在记成功之前崩溃，都可能再送到 agent。
 3. 每条消息记下 `context_token`（回复时要带）、`last_inbound_ms`（24h 窗口计时起点）。
 4. 图片 / 语音 / 文件 / 视频：从微信 CDN 下载、AES-128-ECB 解密、按魔数猜扩展名，存到 `WECHAT_ATTACH_DIR`，
    把绝对路径放进 payload（详见「媒体」）。语音自带转写文字（`voice_item.text`）。
@@ -99,8 +99,9 @@
 1. **`run_forward.sh`（内层）**：`while true` 循环跑 `forward.py`，退出 5 秒后重启；自己的 PID 写进 `forward.pid`。
 2. **`watchdog.sh`（外层，每 15 分钟）**：用 Grok Bot 定时 routine（模板见 `routines/watchdog.md`）或 cron 跑。
    检查 `forward.pid` 是否活着、是不是 `run_forward.sh`、子进程 `forward.py` 在不在、
-   `forward.heartbeat`（主循环每轮写）是否超过 10 分钟没更新。不正常就**先杀掉本目录的旧进程**（避免两个轮询器抢同一个游标），
-   再 `nohup setsid ./run_forward.sh` 拉起。输出单行 `OK` / `RESTARTED (原因)` / `FAILED (原因)`，routine 只在异常时出声。
+   `forward.heartbeat` 是否超过 10 分钟没更新。会话暂停时心跳内容是 `paused`，这时输出 `PAUSED (ilink session -14)`，**不算 OK，也不重启**。
+   进程真死了或心跳过期，才先杀掉本目录的旧进程（避免两个轮询器抢同一个游标），再 `nohup setsid ./run_forward.sh` 拉起。
+   输出单行 `OK` / `PAUSED (ilink session -14)` / `RESTARTED (原因)` / `FAILED (原因)`。`PAUSED` 和 `OK` 都不要发微信。
    需要外层的原因：box / 机器重启后 `run_forward.sh` 自己也没了（原作者的日志里能看到几次这种"无 exited 记录的冷启动"）。
 
 ### 媒体
@@ -134,7 +135,7 @@ cp .env.example .env            # 只放非秘密设置。不要把 webhook URL 
 4. **启动**：`nohup setsid ./run_forward.sh >/dev/null 2>&1 &`，看 `tail -f forward.log`。在微信里给 ClawBot 发一句话试试。
 5. **看门狗**：建一个每 15 分钟的定时 routine（`routines/watchdog.md`），或 cron：
    `*/15 * * * * /path/to/grokbot-wechat/watchdog.sh >> /path/to/watchdog.log 2>&1`
-6. **主动推送**：其他 routine（日报、提醒）里让 agent 调 `python3 send.py --app "…"`；exit 3 表示已排队，不用重试。
+6. **主动推送**：其他 routine（日报、提醒）里让 agent 调 `python3 send.py --app "…"`。exit 3 表示已排队，不用自己重试；exit 5 表示结果不确定，不要自动再发一次。
 
 离线测试（不连网）：`python3 -m unittest discover -s tests -v`
 
@@ -191,9 +192,11 @@ cp .env.example .env            # 只放非秘密设置。不要把 webhook URL 
 **grokbot-wechat** bridges WeChat (via Tencent's official **ClawBot / iLink** bot protocol) to a **Grok Bot**
 webhook routine, so WeChat becomes a chat front-end for your agent.
 
-- **Inbound**: `forward.py` long-polls `ilink/bot/getupdates`, dedupes, downloads + AES-128-ECB-decrypts media from the
-  WeChat CDN, buffers messages in a disk-backed `pending.json`, and POSTs them as **one batch** once you pause (3s) or after 60s,
-  together with the last 40 lines of a stitched `history.log` (each webhook run is a fresh agent run).
+- **Inbound**: `forward.py` long-polls `ilink/bot/getupdates`, keeps every seen `message_id` (no length cap), downloads
+  and AES-128-ECB-decrypts media from the WeChat CDN, buffers messages in `pending.json`, and POSTs them as **one batch**
+  once you pause (3s) or after 60s, with the last 40 lines of `history.log`. This is still at-least-once: a new id for the
+  same content, a lost seen file, or a crash before the webhook result is recorded can deliver a batch again. Messages
+  with no `message_id` are not deduped.
 - **Outbound**: the agent replies with `send.py "text" --reply-to-ms <trigger_ms>`. Sends go only to the scan-bound
   `ilink_user_id`. If the owner has sent something newer, it exits **4 (SUPERSEDED)** and sends nothing. A definite
   WeChat refusal (`ret` / `errcode`) is queued in `outbox.json` (exit **3**) with that owner id fixed on the item.
@@ -202,8 +205,9 @@ webhook routine, so WeChat becomes a chat front-end for your agent.
 - **Keep-alive nudge**: one short "reply 1 to renew" message 18–23h after your last message, never during quiet
   hours (00:00–07:59 Beijing); if that slot is all quiet hours, it's sent early (≥12h) 30 min before quiet hours start.
   A bare "1" gets a `context_note` so the agent just acks it.
-- **Watchdog**: `run_forward.sh` restarts `forward.py` on exit; `watchdog.sh` (every 15 min via a scheduled routine or cron)
-  restarts the whole thing after reboots or a stale heartbeat, killing only this directory's processes first so two pollers never share a cursor.
+- **Watchdog**: `run_forward.sh` restarts `forward.py` on exit. `watchdog.sh` (every 15 min) restarts after a reboot or a
+  stale heartbeat. While iLink is in the one-hour `-14` pause the heartbeat says `paused` and the script prints
+  `PAUSED (ilink session -14)` instead of `OK`, and it does not restart that pause.
 - **Secrets are not included**: run `bind.py` to get your own `credentials.json`. Export `WECHAT_WEBHOOK_URL` and
   `WECHAT_WEBHOOK_KEY` in the process environment only; `.env` is not read for those two. Runtime state, logs and media are git-ignored.
   `ret` or `errcode` `-14` pauses iLink calls for one hour. Replacing `credentials.json` clears that pause.

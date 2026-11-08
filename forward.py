@@ -13,8 +13,7 @@ from config import webhook_url, webhook_key, OWNER_NAME
 from ilink import DIR, load_state, save_state, atomic_json, updates_status, norm_id, clamp_longpoll_ms, redact
 
 SEEN = os.path.join(DIR, "forward_seen.json")      # recent message_ids, for dedupe
-HEARTBEAT = os.path.join(DIR, "forward.heartbeat") # touched after every long-poll; watchdog.sh checks its age
-SEEN_CAP = 10000
+HEARTBEAT = os.path.join(DIR, "forward.heartbeat") # plain epoch while polling; "paused <until> <written>" during -14
 TRANSIENT_CAP = 30                                 # outer webhook retries at 60s, then hold until process restart
 logging.basicConfig(filename=os.path.join(DIR, "forward.log"), level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
@@ -57,14 +56,73 @@ def post_webhook(payload, tries=5, sleep=time.sleep):
     return None
 
 def load_seen():
+    """Ids already accepted. Pending ids are included so a crash after enqueue still dedups.
+    The list is not trimmed: a capped list would forget ids the server can replay."""
+    ids = []
     try:
         with open(SEEN, encoding="utf-8") as f:
-            return [norm_id(x) for x in json.load(f)]
+            ids = [norm_id(x) for x in json.load(f) if norm_id(x)]
     except Exception:
-        return []
+        ids = []
+    try:
+        with open(PENDING, encoding="utf-8") as f:
+            pending = json.load(f)
+        for m in pending.get("messages") or []:
+            mid = norm_id(m.get("message_id"))
+            if mid and mid not in ids:
+                ids.append(mid)
+    except Exception:
+        pass
+    return ids
+
+def merge_seen(seen, new_ids):
+    seen_set = set(seen)
+    merged = list(seen)
+    for mid in new_ids:
+        if mid and mid not in seen_set:
+            merged.append(mid)
+            seen_set.add(mid)
+    return merged
 
 def save_seen(ids):
     atomic_json(SEEN, ids)
+
+def heartbeat_text(now=None):
+    """Plain epoch while polling. A paused line is not a healthy heartbeat."""
+    now = int(time.time() if now is None else now)
+    if ilink.session_paused(now):
+        until = int(ilink.load_state().get("session_pause_until") or 0)
+        return "paused %d %d" % (until, now)
+    return str(now)
+
+def write_heartbeat(now=None):
+    line = heartbeat_text(now)
+    with open(HEARTBEAT, "w", encoding="utf-8") as f:
+        f.write(line + "\n")
+    os.chmod(HEARTBEAT, 0o600)
+    return line
+
+def heartbeat_state(text=None, now=None, stale_s=600):
+    """ok, starting, paused, stale, or unknown. paused is never ok."""
+    now = int(time.time() if now is None else now)
+    if text is None:
+        try:
+            with open(HEARTBEAT, encoding="utf-8") as f:
+                text = f.read()
+        except OSError:
+            return "starting"
+    parts = (text or "").split()
+    if not parts:
+        return "starting"
+    if parts[0] == "paused":
+        return "paused"
+    try:
+        written = int(parts[0])
+    except ValueError:
+        return "unknown"
+    if now - written > stale_s:
+        return "stale"
+    return "ok"
 
 def current_timeout_s():
     ms = clamp_longpoll_ms(load_state().get("longpolling_timeout_ms"))
@@ -170,16 +228,26 @@ class Batcher:
         os.chmod(tmp, 0o600)
         os.replace(tmp, self.path)
 
+    def _add_unlocked(self, payload):
+        mid = norm_id(payload.get("message_id"))
+        if mid is not None and any(norm_id(m.get("message_id")) == mid for m in self.msgs):
+            return
+        now = self.clock()
+        if not self.msgs: self.oldest = now
+        self.msgs.append(payload); self.last = now
+        self._save()
+        log.info("buffered message_id=%s (pending=%d)", mid, len(self.msgs))
+
     def add(self, payload):
         with self.lock:
-            mid = norm_id(payload.get("message_id"))
-            if mid is not None and any(norm_id(m.get("message_id")) == mid for m in self.msgs):
-                return
-            now = self.clock()
-            if not self.msgs: self.oldest = now
-            self.msgs.append(payload); self.last = now
-            self._save()
-            log.info("buffered message_id=%s (pending=%d)", mid, len(self.msgs))
+            self._add_unlocked(payload)
+
+    def accept(self, payloads, after_add):
+        """Add payloads and run after_add while the flusher cannot run. after_add persists seen ids."""
+        with self.lock:
+            for payload in payloads:
+                self._add_unlocked(payload)
+            after_add()
 
     def due(self):
         now = self.clock()
@@ -196,8 +264,9 @@ class Batcher:
                 "trigger_ms": trigger_ms,
                 "reply_rule": "Pass --reply-to-ms %d to every send.py call. Exit code 4 (SUPERSEDED) means %s "
                               "sent something newer: stop immediately, send nothing, file nothing; the newer run "
-                              "handles it. Exit code 3 means a definite WeChat refusal was queued. Exit code 5 "
-                              "means the send was ambiguous: do not call send.py again for that attempt."
+                              "handles it. Exit code 3 means a definite WeChat refusal was queued; do not retry it. "
+                              "Exit code 5 means the send was ambiguous: do not call send.py again for that attempt. "
+                              "Exit code 6 means the send was refused before it started."
                               % (trigger_ms, OWNER_NAME),
                 "history": history.tail(40, self.history_path)}
         hist_lines = [l for l in body["history"].splitlines() if l.strip()]
@@ -283,16 +352,8 @@ def handle_updates(obj, batcher):
         stored = dict(m)
         st["raw_log"] = ((st.get("raw_log") or []) + [stored])[-20:]
         log.info("received message_id=%s types=%s files=%s", mid, payload["item_types"], len(payload.get("files") or []))
-    for payload in pending_adds:
-        batcher.add(payload)
-    merged = list(seen)
-    for mid in new_ids:
-        if mid not in seen_set:
-            merged.append(mid); seen_set.add(mid)
-    if len(merged) > SEEN_CAP:
-        log.info("seen evicted=%d", len(merged) - SEEN_CAP)
-        merged = merged[-SEEN_CAP:]
-    save_seen(merged)
+    merged = merge_seen(seen, new_ids)
+    batcher.accept(pending_adds, lambda: save_seen(merged))
     if obj.get("get_updates_buf"): st["get_updates_buf"] = obj["get_updates_buf"]
     if obj.get("longpolling_timeout_ms"):
         st["longpolling_timeout_ms"] = clamp_longpoll_ms(obj["longpolling_timeout_ms"])
@@ -327,8 +388,7 @@ def main():
     fails = 0
     while True:
         try:
-            with open(HEARTBEAT, "w") as f: f.write(str(int(time.time())))
-            os.chmod(HEARTBEAT, 0o600)
+            write_heartbeat()
         except OSError: pass
         if ilink.session_paused():
             time.sleep(15); continue

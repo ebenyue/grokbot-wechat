@@ -3,7 +3,9 @@
 # run_forward.sh already restarts forward.py when it crashes; this script covers the cases it can't:
 #   * the machine/box restarted and run_forward.sh itself is gone
 #   * forward.py is alive but stuck (heartbeat older than STALE_S)
-# Prints exactly one status line: OK / RESTARTED (reason) / FAILED (reason). Exit 0 unless FAILED.
+# Prints exactly one status line: OK / PAUSED (ilink session -14) / RESTARTED (reason) / FAILED (reason).
+# PAUSED means the process is up and iLink is in the documented one-hour stale-token pause.
+# That is not healthy and this script does not restart it. Exit 0 unless FAILED.
 cd "$(dirname "$(readlink -f "$0")")" || exit 2
 DATA="${BRIDGE_DATA_DIR:-.}"
 STALE_S="${STALE_S:-600}"     # long-poll returns every ~40s; 10 min without a heartbeat means stuck
@@ -16,9 +18,16 @@ elif ! pgrep -P "$pid" -f forward.py >/dev/null; then
   reason="forward.py not running"   # normally restarted within 5s by run_forward.sh; give it one more look
   sleep 8; pgrep -P "$pid" -f forward.py >/dev/null && reason=""
 fi
-if [ -z "$reason" ] && [ -f "$DATA/forward.heartbeat" ]; then
-  age=$(( $(date +%s) - $(cat "$DATA/forward.heartbeat" 2>/dev/null || echo 0) ))
-  [ "$age" -gt "$STALE_S" ] && reason="heartbeat stale (${age}s)"
+if [ -z "$reason" ]; then
+  # Same data dir as forward.py (process env, else its .env). A paused line is not OK and is not restarted.
+  hb_state="$(STALE_S="$STALE_S" python3 -c 'import os,forward; print(forward.heartbeat_state(stale_s=int(os.environ.get("STALE_S","600"))))' 2>/dev/null || echo unknown)"
+  if [ "$hb_state" = "paused" ]; then
+    echo "PAUSED (ilink session -14) pid=$pid"
+    exit 0
+  fi
+  if [ "$hb_state" != "ok" ] && [ "$hb_state" != "starting" ]; then
+    reason="heartbeat ${hb_state}"
+  fi
 fi
 
 if [ -z "$reason" ]; then
