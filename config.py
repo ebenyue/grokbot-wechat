@@ -1,11 +1,13 @@
-"""Central configuration. Everything personal/secret comes from environment variables or a local `.env`
-file (see .env.example). Nothing secret is hard-coded in this repo."""
-import json, os
+"""Central configuration. Non-secret settings may come from the environment or a local `.env`.
+Webhook URL and bearer key are read only from the process environment, never from `.env` or a secrets file."""
+import os
 
 CODE_DIR = os.path.dirname(os.path.abspath(__file__))
+_SECRET_ENV = {"WECHAT_WEBHOOK_URL", "WECHAT_WEBHOOK_KEY", "WECHAT_SECRETS_FILE"}
 
 def _load_dotenv(path):
-    """Tiny .env loader (KEY=VALUE per line, # comments). Never overrides variables already in the env."""
+    """Tiny .env loader (KEY=VALUE per line, # comments). Never overrides variables already in the env.
+    Webhook secrets are ignored even if a file contains them."""
     try:
         with open(path, encoding="utf-8") as f:
             for line in f:
@@ -13,6 +15,7 @@ def _load_dotenv(path):
                 if not line or line.startswith("#") or "=" not in line: continue
                 k, v = line.split("=", 1)
                 k, v = k.strip(), v.strip()
+                if k in _SECRET_ENV: continue
                 if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"": v = v[1:-1]
                 os.environ.setdefault(k, v)
     except FileNotFoundError:
@@ -23,27 +26,17 @@ _load_dotenv(os.path.join(CODE_DIR, ".env"))
 def _env(name, default=""):
     return os.environ.get(name, default).strip()
 
+def webhook_url():
+    """Process environment only. A value copied into .env is not used."""
+    return os.environ.get("WECHAT_WEBHOOK_URL", "").strip()
+
+def webhook_key():
+    """Process environment only. WECHAT_SECRETS_FILE is not consulted."""
+    return os.environ.get("WECHAT_WEBHOOK_KEY", "").strip()
+
 # Where runtime files live: credentials.json, state.json, pending.json, outbox.json, history.log, logs.
 DATA_DIR = os.path.abspath(os.path.expanduser(_env("BRIDGE_DATA_DIR") or CODE_DIR))
 os.makedirs(DATA_DIR, exist_ok=True)
-
-# --- inbound: WeChat -> Grok Bot webhook routine ---
-WEBHOOK_URL = _env("WECHAT_WEBHOOK_URL")            # the URL of your Grok Bot routine's webhook trigger
-SECRETS_FILE = _env("WECHAT_SECRETS_FILE")          # optional JSON file holding WECHAT_WEBHOOK_KEY (any nesting depth 1)
-
-def webhook_key():
-    """Bearer key for the webhook. Env WECHAT_WEBHOOK_KEY wins; else look it up in WECHAT_SECRETS_FILE."""
-    k = _env("WECHAT_WEBHOOK_KEY")
-    if k or not SECRETS_FILE: return k
-    try:
-        d = json.load(open(os.path.expanduser(SECRETS_FILE)))
-        if isinstance(d, dict) and d.get("WECHAT_WEBHOOK_KEY"): return str(d["WECHAT_WEBHOOK_KEY"]).strip()
-        for sect in (d.values() if isinstance(d, dict) else []):
-            if isinstance(sect, dict) and sect.get("WECHAT_WEBHOOK_KEY"):
-                return str(sect["WECHAT_WEBHOOK_KEY"]).strip()
-    except Exception:
-        pass
-    return ""
 
 # Downloaded images / files / voice / video land here; the path is passed to the agent in the webhook payload.
 ATTACH_DIR = os.path.abspath(os.path.expanduser(_env("WECHAT_ATTACH_DIR") or os.path.join(DATA_DIR, "attachments")))
