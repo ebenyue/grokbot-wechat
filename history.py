@@ -42,6 +42,8 @@ def append(line, path=None):
         f.seek(0); lines = f.readlines()
         if len(lines) > MAX_LINES:
             f.seek(0); f.truncate(); f.writelines(lines[-KEEP_LINES:])
+    try: os.chmod(path, 0o600)
+    except OSError: pass
 
 def tail(n=40, path=None):
     path = path or HISTORY
